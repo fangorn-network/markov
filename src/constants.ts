@@ -32,9 +32,14 @@
 
 import type { KernelParams } from './types.ts'
 
-export const D = 384
+/** Canonical embedding space: nomic-embed-text-v1.5.
+ *  Matryoshka, so 512/256/128 truncations stay usable for centroids and
+ *  coarse scans. Override per-kernel with `params.d` when mounting a
+ *  catalogue that declares a different `embedding.dim`. */
+export const D = 768
 
 export const DEFAULTS: Required<KernelParams> = {
+  d:                 D,
   // geometric
   alpha:             0.10,
   beta:              0.30,

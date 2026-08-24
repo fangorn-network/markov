@@ -3,6 +3,9 @@ import type { Vec } from './Vec.ts'
 // ── Params ────────────────────────────────────────────────────────────────────
 
 export interface KernelParams {
+  /** Dimension of the embedding space. Must match the catalogue's
+   *  `embedding.dim`; a kernel is only meaningful inside one space. */
+  d?: number
   // ── geometric ──────────────────────────────────────────────────────────────
   /** Position EMA rate α ∈ (0,1). */
   alpha?: number

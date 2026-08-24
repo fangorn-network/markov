@@ -52,16 +52,32 @@ on your disk. Nobody else has a copy.
 npm test          # node test/kernel.test.ts — no deps, Node 22.18+
 ```
 
-Five assertions: playing leans the query, ranking follows the lean, skipping
-pushes away, state survives serialisation, and — the interesting one — a profile
-built only in domain A correctly ranks an **unseen domain B** sharing the space.
-Current margin on synthetic vectors: **4.1x**.
+Five assertions, run in two spaces: playing leans the query, ranking follows the
+lean, skipping pushes away, state survives serialisation, and — the interesting
+one — a profile built only in catalogue A correctly ranks an **unseen catalogue
+B** sharing the space. Current margin on synthetic vectors: **4.1x**.
+
+```
+ok  d=384            lean=0.983  skip=0.0204->0.0144  transfer=4.14x
+ok  d=768 (canonical) lean=0.983  skip=0.0204->0.0144  transfer=4.14x
+```
+
+## The space
+
+The canonical space is **`nomic-embed-text-v1.5`, 768 dims**, chosen because it
+is Matryoshka: the same vectors truncate to 512/256/128 for centroids and coarse
+scans, which is what lets a catalogue advertise its coverage in kilobytes. It is
+Apache-2.0, has ONNX weights for in-browser use, and is English-first — that last
+one is the known exposure.
+
+A kernel is only meaningful inside one space. `params.d` sets the dimension and
+must match the catalogue's declared `embedding.dim`; two catalogues on different
+models are different spaces, and moving a profile between them needs a learned
+projection that does not exist yet.
 
 ## Known limits
 
-- **`D = 384` is hardcoded** (`constants.ts`), inherited from `all-MiniLM-L6-v2`.
-  Transfer across *different* embedding spaces needs either one canonical model
-  or a learned projection between them. Nothing here does that yet.
+- No projection between spaces. A profile does not survive a change of model.
 - The transfer result above is synthetic — clean, well-separated regions. It
   proves the mechanism, not that real cross-domain taste is legible.
 - Tag roles (`genres/moods/themes/contexts`) are music-shaped names for what are

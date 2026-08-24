@@ -210,6 +210,7 @@ export const initFromSeeds = (
   params: KernelParams = {},
 ): KernelState => {
   const { sigma_base = DEFAULTS.sigma_base } = params
+  const d = params.d ?? tracks[0]?.embedding.length ?? DEFAULTS.d
 
   const harmonicWeights = tracks.map((_, i) => 1 / Math.log(i + 2))
   const mu = weightedMean(tracks.map(t => t.embedding), harmonicWeights)
@@ -225,7 +226,7 @@ export const initFromSeeds = (
 
   return {
     mu,
-    v:            zeros(D),
+    v:            zeros(d),
     sigma:        sigma_base,
     skips:        [],
     skipCentroid: null,
@@ -242,10 +243,10 @@ export const initFromSeeds = (
 }
 
 export const emptyKernel = (params: KernelParams = {}): KernelState => {
-  const { sigma_base = DEFAULTS.sigma_base } = params
+  const { sigma_base = DEFAULTS.sigma_base, d = DEFAULTS.d } = params
   return {
-    mu:           zeros(D),
-    v:            zeros(D),
+    mu:           zeros(d),
+    v:            zeros(d),
     sigma:        sigma_base,
     skips:        [],
     skipCentroid: null,
@@ -551,7 +552,7 @@ export const onSkip = (
 
 export const onJump = (state: KernelState, params: KernelParams = {}): KernelState => {
   const { sigma_base = DEFAULTS.sigma_base } = params
-  return { ...state, v: zeros(D), sigma: sigma_base }
+  return { ...state, v: zeros(state.mu.length), sigma: sigma_base }
 }
 
 export const resetKernel = (params: KernelParams = {}): KernelState =>
