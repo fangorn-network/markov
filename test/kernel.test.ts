@@ -2,7 +2,7 @@
  * One runnable check for the kernel, and one experiment.
  *
  * The check: playing moves the query toward what you played, skipping pushes
- * it away, and state survives a serialise round-trip.
+ * it away, and state survives a serialize round-trip.
  *
  * The experiment (`transfer`): a profile is built ONLY from items in catalogue
  * A, then used to rank items in catalogue B that the kernel has never seen. If
@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { D } from '../src/constants.ts'
-import { emptyKernel, onPlay, onSkip, queryVector, reweight, serialiseState, deserialiseState } from '../src/SessionKernel.ts'
+import { emptyKernel, onPlay, onSkip, queryVector, reweight, serializeState, deserializeState } from '../src/SessionKernel.ts'
 import type { TrackFeatures, ChromaHit } from '../src/types.ts'
 import { zeros, dot, norm, scale } from '../src/Vec.ts'
 
@@ -74,7 +74,7 @@ const run = (d: number) => {
   assert.ok(afterB < beforeB, `skipping a region must lower its weight (${beforeB.toFixed(4)} -> ${afterB.toFixed(4)})`)
 
   // ── 4. state survives a round-trip ────────────────────────────────────────
-  const back = deserialiseState(serialiseState(k2))
+  const back = deserializeState(serializeState(k2))
   assert.deepEqual(Array.from(back.mu), Array.from(k2.mu), 'mu must survive serialisation')
   assert.equal(back.mu.length, d, 'dimension must survive serialisation')
 

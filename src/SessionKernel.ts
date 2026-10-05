@@ -9,7 +9,7 @@
  *   v ∈ ℝ^d              velocity  (EMA of displacement — direction of travel)
  *   σ ∈ ℝ^+              spread    (query Gaussian width)
  *   S ∈ (ℝ^d)^{≤W}       skip buffer
- *   c ∈ ℝ^d | null       skip centroid  ─┐ parameterise regional repulsion
+ *   c ∈ ℝ^d | null       skip centroid  ─┐ parameterize regional repulsion
  *   r ∈ ℝ^+              skip radius    ─┘ recomputed on every onSkip
  *   η ∈ [0,1]            entropy
  *   taste                leaky accumulators over {genres, moods, themes, contexts}
@@ -449,14 +449,14 @@ export const onPlay = (
  *     - muted ← muted ∪ {a}          session-scoped, not persisted
  *     - neg unchanged                 no path to permanent blacklist
  *     - artist EMA unchanged          preference signal preserved
- *     - taste penalised lightly       the track's tags still got a skip signal
+ *     - taste penalized lightly       the track's tags still got a skip signal
  *     - geometric effects fire        track region is still repelled this session
  *
  *   Genuine dislike  (artists[a] ≤ fatigue_threshold):
  *     - neg[a] += delta_skip          path to permanent blacklist
  *     - blacklist updated if needed
  *     - artist EMA updated toward −1
- *     - taste penalised               full categorical signal
+ *     - taste penalized               full categorical signal
  *     - geometric effects fire
  *
  * Geometric effects (velocity deflection, position repulsion, skip buffer,
@@ -499,7 +499,7 @@ export const onSkip = (
     // Session mute — transient, no blacklist progression
     muted1 = new Set(state.muted)
     muted1.add(artistId)
-    // Still penalise taste lightly (the specific track's tags got a skip)
+    // Still penalize taste lightly (the specific track's tags got a skip)
     taste1 = penalizeTaste(state.taste, track, skip_taste_pen)
     // artists EMA and neg are intentionally unchanged
   } else {
@@ -562,7 +562,7 @@ export const resetKernel = (params: KernelParams = {}): KernelState =>
 // Serialisation — muted intentionally excluded (session-only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const serialiseState = (state: KernelState): KernelStateJSON => ({
+export const serializeState = (state: KernelState): KernelStateJSON => ({
   mu:           toArray(state.mu),
   v:            toArray(state.v),
   sigma:        state.sigma,
@@ -580,7 +580,7 @@ export const serialiseState = (state: KernelState): KernelStateJSON => ({
 })
 
 /** Rehydrated state always has muted = new Set() — session fatigue clears between sessions. */
-export const deserialiseState = (json: KernelStateJSON): KernelState => ({
+export const deserializeState = (json: KernelStateJSON): KernelState => ({
   mu:           new Float32Array(json.mu),
   v:            new Float32Array(json.v),
   sigma:        json.sigma,

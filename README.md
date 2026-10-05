@@ -1,21 +1,18 @@
-# kernel
+# Markov
 
-A **taste kernel**: a local, portable point-of-view in an embedding space.
+A **markov kernel** for locally storing and encoding user preference as they navigate a higher-dimensional embedding space. It provides a local, portable point-of-view in an embedding space.
 
-Lifted verbatim from the SOND3R Electron app, where it was tangled up with a
-renderer. It has no host dependencies — no React, no Electron, no vector DB, no
-network. Pure functions, state in, state out.
+It has zero host dependencies and operates agnostically of the underlying embedding model.
 
 ## The idea
 
-Your taste and the content live in the same space, so preference is geometry.
-The kernel tracks a position, a direction of travel, and a spread:
+Your "taste" and the content live in the same space, so we can think of preference as a *measure* within a *measure space*. The Markov kernel tracks a position, a direction of travel, and a spread as you interact with content in a given embedding space:
 
 | | |
 |---|---|
-| `mu` | where you are — EMA of what you played |
-| `v` | where you're heading — EMA of displacement |
-| `sigma` | how wide to cast — grows on skips, shrinks on plays |
+| `mu` | where you are - EMA of what you played |
+| `v` | where you're heading - EMA of displacement |
+| `sigma` | how wide to cast - grows on skips, shrinks on plays |
 | `taste` | leaky accumulators over tags |
 | `artists` | signed EMA: +1 played, −1 skipped |
 | `neg` / `blacklist` | permanent suppression |
@@ -43,7 +40,7 @@ const hits = await db.search(queryVector(k))
 const ranked = reweight(hits, k).sort((a, b) => b.weight - a.weight)
 ```
 
-`serialiseState` / `deserialiseState` round-trip it to JSON. It is a small file
+`serializeState` / `deserializeState` round-trip it to JSON. It is a small file
 on your disk. Nobody else has a copy.
 
 ## Check
@@ -66,7 +63,7 @@ ok  d=768 (canonical) lean=0.983  skip=0.0204->0.0144  transfer=4.14x
 
 The canonical space is **`nomic-embed-text-v1.5`, 768 dims**, chosen because it
 is Matryoshka: the same vectors truncate to 512/256/128 for centroids and coarse
-scans, which is what lets a catalogue advertise its coverage in kilobytes. It is
+scans, which is what lets a catalogue advertize its coverage in kilobytes. It is
 Apache-2.0, has ONNX weights for in-browser use, and is English-first — that last
 one is the known exposure.
 
