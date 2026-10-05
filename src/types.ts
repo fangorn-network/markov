@@ -13,11 +13,11 @@ export interface KernelParams {
   beta?: number
   /** Lookahead saturation bound λ_max.
    *  Must exceed the radius of clusters you want the kernel to escape from.
-   *  Calibrate against your ChromaDB point cloud. */
+   *  Calibrate against your catalogue's point cloud. */
   lambda_max?: number
-  /** Baseline spread σ_base. Spread contracts toward this on plays. */
+  /** Baseline spread σ_base. Spread contracts toward this on likes. */
   sigma_base?: number
-  /** Maximum spread σ_max. Spread cannot exceed this on skips. */
+  /** Maximum spread σ_max. Spread cannot exceed this on passes. */
   sigma_max?: number
   /** Spread EMA rate ρ ∈ (0,1). */
   rho?: number
@@ -25,8 +25,8 @@ export interface KernelParams {
   epsilon?: number
   /** Prior pull decay constant k. Pull = k/t decays with timestep. */
   prior_k?: number
-  /** Skip buffer capacity W. Older skips are evicted FIFO. */
-  skip_window?: number
+  /** Pass buffer capacity W. Older passes are evicted FIFO. */
+  pass_window?: number
 
   // ── repulsion ──────────────────────────────────────────────────────────────
   /**
@@ -37,7 +37,7 @@ export interface KernelParams {
   /**
    * Amplitude of the Gaussian regional repulsion field in the log-weight.
    *   − γ_reg · exp(−‖e − c‖² / (2r²))
-   * Field is centred at the skip cluster centroid with width = skip radius.
+   * Field is centred at the pass centroid with width = pass radius.
    */
   gamma_reg?: number
 
@@ -47,108 +47,110 @@ export interface KernelParams {
   /** Maximum Gibbs temperature (high entropy / exploration). */
   temp_max?: number
 
-  // ── taste accumulators ─────────────────────────────────────────────────────
-  /** Accumulation rate for taxonomy tags on play. */
-  alpha_taste?: number
-  /** Per-step decay rate for all taste weights. */
-  taste_decay?: number
-  /** Per-tag penalty applied to taxonomy accumulators on skip. */
-  skip_taste_pen?: number
+  // ── facet accumulators ─────────────────────────────────────────────────────
+  /** Accumulation rate for facet tags on a like. */
+  alpha_facet?: number
+  /** Per-step decay rate for all facet weights. */
+  facet_decay?: number
+  /** Per-tag penalty applied to facet accumulators on a pass. */
+  pass_facet_pen?: number
 
-  // ── artist affinity ────────────────────────────────────────────────────────
-  /** Artist EMA smoothing factor β_art ∈ (0,1). Higher = slower to forget. */
-  beta_artist?: number
+  // ── group affinity ─────────────────────────────────────────────────────────
+  /** Group EMA smoothing factor β_group ∈ (0,1). Higher = slower to forget. */
+  beta_group?: number
   /**
-   * Logistic steepness c for the artist affinity transform.
-   *   f_art = 2σ(c · artists[a])
-   * Equals 1 at artists[a]=0 (neutral). Unbounded below as artists[a]→−∞.
+   * Logistic steepness c for the group affinity transform.
+   *   f_group = 2σ(c · groups[g])
+   * Equals 1 at groups[g]=0 (neutral). Unbounded below as groups[g]→−∞.
    */
-  art_logistic_c?: number
+  group_logistic_c?: number
 
-  // ── duration preference ────────────────────────────────────────────────────
-  /** Duration EMA smoothing factor ρ_dur ∈ (0,1). */
-  rho_duration?: number
-  /** Standard deviation (ms) for the soft duration preference Gaussian. */
-  dur_sigma_ms?: number
+  // ── scalar preference ──────────────────────────────────────────────────────
+  /** Scalar-preference EMA smoothing factor ρ_scalar ∈ (0,1). */
+  rho_scalar?: number
+  /** Width of the soft scalar preference, in log-ratio units: an item at
+   *  e^σ times (or 1/e^σ of) the preferred value scores exp(−½). Unit-free, so
+   *  it means the same for a duration, a price or a page count. */
+  scalar_sigma?: number
 
   // ── log-weight coefficients ────────────────────────────────────────────────
-  /** Taxonomy affinity coefficient τ_cat. */
-  tau_cat?: number
-  /** Artist affinity coefficient τ_art. */
-  tau_art?: number
-  /** Duration affinity coefficient τ_dur. */
-  tau_dur?: number
-  /** Floor for taxonomy dimension scores. Prevents total suppression of
+  /** Facet affinity coefficient τ_facet. */
+  tau_facet?: number
+  /** Group affinity coefficient τ_group. */
+  tau_group?: number
+  /** Scalar affinity coefficient τ_scalar. */
+  tau_scalar?: number
+  /** Floor for per-channel facet scores. Prevents total suppression of
    *  unexplored tag space early in a session. */
-  cat_floor?: number
+  facet_floor?: number
 
   // ── persistent suppression ────────────────────────────────────────────────
-  /** Negative accumulator increment per genuine-dislike skip. neg[a] += delta_skip. */
-  delta_skip?: number
+  /** Negative accumulator increment per genuine-dislike pass. neg[g] += delta_pass. */
+  delta_pass?: number
   /**
    * Suppression threshold θ_B.
-   * Artist enters the blacklist permanently when neg[a] > theta_B.
+   * A group enters the blacklist permanently when neg[g] > theta_B.
    */
   theta_B?: number
 
   // ── session fatigue ────────────────────────────────────────────────────────
   /**
-   * Artist EMA value above which a skip is interpreted as session fatigue
-   * rather than genuine dislike.
+   * Group EMA value above which a pass is read as session fatigue rather than
+   * genuine dislike.
    *
-   * When artists[a] > fatigue_threshold at skip time:
-   *   → artist is added to the session-scoped `muted` set
-   *   → neg[a] is NOT incremented (no path to blacklist)
-   *   → artist EMA is NOT updated (still liked)
-   *   → geometric repulsion still fires (track won't resurface this session)
+   * When groups[g] > fatigue_threshold at pass time:
+   *   → group is added to the session-scoped `muted` set
+   *   → neg[g] is NOT incremented (no path to blacklist)
+   *   → group EMA is NOT updated (still liked)
+   *   → geometric repulsion still fires (item won't resurface this session)
    *
-   * When artists[a] ≤ fatigue_threshold at skip time:
+   * When groups[g] ≤ fatigue_threshold at pass time:
    *   → treated as genuine dislike
-   *   → neg[a] incremented as normal
+   *   → neg[g] incremented as normal
    *
-   * With beta_artist=0.7, artists[a] exceeds 0.3 after roughly one play,
-   * and exceeds 0.5 after two plays. Set higher to require more plays before
-   * a skip is treated as fatigue rather than dislike.
+   * With beta_group=0.7, groups[g] exceeds 0.3 after roughly one like, and
+   * 0.5 after two. Set higher to require more likes before a pass is treated
+   * as fatigue rather than dislike.
    */
   fatigue_threshold?: number
 }
 
-// ── Track data ────────────────────────────────────────────────────────────────
+// ── Items ─────────────────────────────────────────────────────────────────────
 
-export type FieldValue = string | number | boolean | null
+/** Facet tags by channel, e.g. `{ genre: ['ambient'], mood: ['calm'] }`. The
+ *  channel names are the caller's; the kernel only keeps them apart. */
+export type Facets = Record<string, string[]>
 
-export interface TasteWeights {
-  genres:   Record<string, number>
-  moods:    Record<string, number>
-  themes:   Record<string, number>
-  contexts: Record<string, number>
+/** Learned facet weights by channel, then by tag. */
+export type FacetWeights = Record<string, Record<string, number>>
+
+/**
+ * Something a person can like or pass on. Only the embedding is required; every
+ * other field adds one signal when present and is ignored when absent.
+ */
+export interface Item {
+  embedding: Vec
+  /** Who or what the item belongs to: an artist, a developer, a publisher, a
+   *  feed. Group affinity, fatigue and permanent suppression act on it. */
+  group?: string
+  /** Tags by channel. */
+  facets?: Facets
+  /** A positive quantity the person develops a preferred value of: a duration,
+   *  a price, a length. Compared as a ratio, so its unit does not matter. */
+  scalar?: number
 }
 
-export interface TrackFeatures {
-  embedding:  Vec
-  artistId:   string
-  genres:     string[]
-  moods:      string[]
-  themes:     string[]
-  contexts:   string[]
-  durationMs: number
-}
+/** The non-geometric part of an item, as carried on a search hit. */
+export type ItemMeta = Omit<Item, 'embedding'>
 
-export interface ChromaHit {
+export interface Hit {
   id:        string
   embedding: number[] | Float32Array
   distance:  number
-  metadata?: {
-    artistId:   string
-    genres:     string[]
-    moods:      string[]
-    themes:     string[]
-    contexts:   string[]
-    durationMs: number
-  }
+  metadata?: ItemMeta
 }
 
-export interface WeightedHit extends ChromaHit {
+export interface WeightedHit extends Hit {
   weight: number
 }
 
@@ -156,34 +158,37 @@ export interface WeightedHit extends ChromaHit {
 
 export interface KernelState {
   // geometric
+  /** Position: a recency-weighted mean of liked embeddings. Bias-corrected, so
+   *  it never starts at the origin: the first like IS the position. */
   mu:           Vec
+  /** Velocity: an EMA of displacement between consecutive positions. Zero
+   *  until the second like, since one position has no direction. */
   v:            Vec
   sigma:        number
-  skips:        Vec[]
-  /** Centroid of the skip buffer. Null when buffer is empty. */
-  skipCentroid: Vec | null
-  /** Radius of the skip buffer: max distance from centroid to any skip. */
-  skipRadius:   number
+  passes:       Vec[]
+  /** Centroid of the pass buffer. Null when buffer is empty. */
+  passCentroid: Vec | null
+  /** Radius of the pass buffer: max distance from centroid to any pass. */
+  passRadius:   number
+  /** Number of likes so far. */
   t:            number
   entropy:      number
   // categorical
-  taste:        TasteWeights
-  artists:      Record<string, number>   // signed EMA: +1 = played, −1 = skipped
-  durationPref: number | null
+  facets:       FacetWeights
+  groups:       Record<string, number>   // signed EMA: +1 = liked, −1 = passed
+  scalarPref:   number | null
   // persistent suppression (never decays, survives sessions)
   neg:          Record<string, number>
   blacklist:    Set<string>
   /**
    * Session-scoped mute set.
    *
-   * Artists land here when they are skipped while their EMA is positive
-   * (the user likes them but is fatigued). They are excluded from candidates
-   * for the rest of the session identically to the blacklist, but:
+   * Groups land here when they are passed on while their EMA is positive (the
+   * person likes them but is fatigued). They are excluded from candidates for
+   * the rest of the session identically to the blacklist, but:
    *   - neg is NOT incremented → no path to permanent blacklist
-   *   - artist EMA is NOT updated → preference signal preserved
-   *   - muted is NOT persisted to disk → clears on every cold start
-   *
-   * The user can also clear it explicitly via clearMuted() / unmuteArtist().
+   *   - group EMA is NOT updated → preference signal preserved
+   *   - muted is NOT persisted → clears on every cold start
    */
   muted:        Set<string>
 }
@@ -198,14 +203,14 @@ export interface KernelStateJSON {
   mu:           number[]
   v:            number[]
   sigma:        number
-  skips:        number[][]
-  skipCentroid: number[] | null
-  skipRadius:   number
+  passes:       number[][]
+  passCentroid: number[] | null
+  passRadius:   number
   t:            number
   entropy:      number
-  taste:        TasteWeights
-  artists:      Record<string, number>
-  durationPref: number | null
+  facets:       FacetWeights
+  groups:       Record<string, number>
+  scalarPref:   number | null
   neg:          Record<string, number>
   blacklist:    string[]
   // muted deliberately omitted — session-only

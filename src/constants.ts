@@ -6,28 +6,30 @@
  * Calibration notes
  * ─────────────────
  * lambda_max        Must exceed the radius of the largest cluster you want the
- *                   kernel to escape. Measure empirically against your ChromaDB
- *                   point cloud.
+ *                   kernel to escape. Measure empirically against your
+ *                   catalogue's point cloud.
  *
  * sigma_max         Caps spread at 2× sigma_base by default.
  *
  * gamma_base        Base repulsion step. Actual magnitude = gamma_base × (1+η).
  *                   Decoupled from σ so repulsion does not weaken as spread
- *                   contracts on play.
+ *                   contracts on likes.
  *
- * theta_B           Suppression threshold. With delta_skip=1, an artist is
- *                   permanently blacklisted after 3 genuine-dislike skips.
+ * theta_B           Suppression threshold. With delta_pass=1, a group is
+ *                   permanently blacklisted after 4 genuine-dislike passes
+ *                   (neg must EXCEED theta_B).
  *
- * art_logistic_c    Logistic steepness. c=3 gives f_art ≈ 0.05 at artists=−1
- *                   (strong suppression) and f_art ≈ 1.95 at artists=+1.
+ * group_logistic_c  Logistic steepness. c=3 gives f_group ≈ 0.05 at groups=−1
+ *                   (strong suppression) and f_group ≈ 1.95 at groups=+1.
  *
- * fatigue_threshold Artist EMA value above which a skip is interpreted as
- *                   session fatigue rather than genuine dislike. With
- *                   beta_artist=0.7, artists[a] ≈ 0.30 after 1 play and
- *                   ≈ 0.51 after 2 plays. The default of 0.3 means a single
- *                   prior play is enough to activate fatigue protection.
- *                   Raise to require more listening history before protecting
- *                   an artist from the neg accumulator.
+ * scalar_sigma      0.5 in log-ratio units: an item 1.65× (or 0.6×) the
+ *                   preferred value scores exp(−½) on the scalar term.
+ *
+ * fatigue_threshold Group EMA value above which a pass is read as session
+ *                   fatigue rather than genuine dislike. With beta_group=0.7,
+ *                   groups[g] ≈ 0.30 after 1 like and ≈ 0.51 after 2. The
+ *                   default of 0.3 means a single prior like is enough to
+ *                   activate fatigue protection.
  */
 
 import type { KernelParams } from './types.ts'
@@ -49,7 +51,7 @@ export const DEFAULTS: Required<KernelParams> = {
   rho:               0.80,
   epsilon:           1e-6,
   prior_k:           1.00,
-  skip_window:       20,
+  pass_window:       20,
 
   // repulsion
   gamma_base:        0.15,
@@ -59,27 +61,27 @@ export const DEFAULTS: Required<KernelParams> = {
   temp_base:         1.00,
   temp_max:          3.00,
 
-  // taste
-  alpha_taste:       0.30,
-  taste_decay:       0.05,
-  skip_taste_pen:    0.20,
+  // facets
+  alpha_facet:       0.30,
+  facet_decay:       0.05,
+  pass_facet_pen:    0.20,
 
-  // artist
-  beta_artist:       0.70,
-  art_logistic_c:    3.00,
+  // group
+  beta_group:        0.70,
+  group_logistic_c:  3.00,
 
-  // duration
-  rho_duration:      0.80,
-  dur_sigma_ms:      60_000,
+  // scalar
+  rho_scalar:        0.80,
+  scalar_sigma:      0.50,
 
   // log-weight coefficients
-  tau_cat:           1.00,
-  tau_art:           2.00,
-  tau_dur:           0.50,
-  cat_floor:         0.01,
+  tau_facet:         1.00,
+  tau_group:         2.00,
+  tau_scalar:        0.50,
+  facet_floor:       0.01,
 
   // persistent suppression
-  delta_skip:        1.00,
+  delta_pass:        1.00,
   theta_B:           3.00,
 
   // session fatigue

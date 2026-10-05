@@ -1,59 +1,74 @@
 /**
- * sessionKernel.ts
+ * SessionKernel.ts
  *
- * Corrected Markov kernel over the all-MiniLM-L6-v2 embedding space (d=384, L2).
+ * A Markov kernel over an embedding space: a person's point of view, moved by
+ * what they like and what they pass on. Nothing here knows what an item is.
  *
  * ── State ────────────────────────────────────────────────────────────────────
  *
- *   μ ∈ ℝ^d              position  (EMA of play embeddings)
+ *   μ ∈ ℝ^d              position  (recency-weighted mean of liked embeddings)
  *   v ∈ ℝ^d              velocity  (EMA of displacement — direction of travel)
  *   σ ∈ ℝ^+              spread    (query Gaussian width)
- *   S ∈ (ℝ^d)^{≤W}       skip buffer
- *   c ∈ ℝ^d | null       skip centroid  ─┐ parameterize regional repulsion
- *   r ∈ ℝ^+              skip radius    ─┘ recomputed on every onSkip
+ *   P ∈ (ℝ^d)^{≤W}       pass buffer
+ *   c ∈ ℝ^d | null       pass centroid  ─┐ parameterize regional repulsion
+ *   r ∈ ℝ^+              pass radius    ─┘ recomputed on every onPass
  *   η ∈ [0,1]            entropy
- *   taste                leaky accumulators over {genres, moods, themes, contexts}
- *   artists              signed EMA affinity: +1 = played, −1 = skipped
- *   durationPref         EMA of played duration (ms)
- *   neg                  non-decaying dislike accumulator per artistId
+ *   facets               leaky accumulators over the caller's tag channels
+ *   groups               signed EMA affinity: +1 = liked, −1 = passed
+ *   scalarPref           EMA of liked scalars (log space)
+ *   neg                  non-decaying dislike accumulator per group
  *   blacklist            permanent suppression set
  *   muted                session-scoped fatigue set (not persisted)
  *
- * ── Skip disambiguation ───────────────────────────────────────────────────────
+ * An item is an embedding plus, optionally, a group, facets and a scalar. Each
+ * optional field adds one signal when present and is ignored when absent, so a
+ * caller with nothing but vectors gets the geometric kernel alone.
  *
- *   onSkip() checks artists[a] at skip time to distinguish two signals:
+ * ── Position ─────────────────────────────────────────────────────────────────
  *
- *   Fatigue  (artists[a] > fatigue_threshold):
- *     The user has a positive play history with this artist and is skipping
- *     because they've heard them too much — not because they dislike them.
+ *   μ is a bias-corrected EMA: the t-th like moves it by
+ *     w_t = α / (1 − (1−α)^t)
+ *   of the way to the item. The first like (w=1) IS the position; after that
+ *   the weights settle to α. A plain EMA started at the origin would leave μ
+ *   short for the first dozen likes, and its velocity would mostly measure the
+ *   walk out from the origin rather than the walk between items.
+ *
+ * ── Pass disambiguation ───────────────────────────────────────────────────────
+ *
+ *   onPass() checks groups[g] at pass time to distinguish two signals:
+ *
+ *   Fatigue  (groups[g] > fatigue_threshold):
+ *     The person has a positive history with this group and is passing
+ *     because they've had enough of it for now — not because they dislike it.
  *     → add to muted (session-scoped, not persisted)
  *     → neg unchanged (no path to permanent blacklist)
- *     → artist EMA unchanged (preference signal preserved)
- *     → geometric effects still fire (track won't resurface this session)
+ *     → group EMA unchanged (preference signal preserved)
+ *     → geometric effects still fire (item won't resurface this session)
  *
- *   Genuine dislike  (artists[a] ≤ fatigue_threshold):
- *     Neutral or negative prior history — skip is likely real aversion.
- *     → neg[a] += delta_skip (path to permanent blacklist at theta_B)
- *     → artist EMA updated toward −1
- *     → full categorical + geometric effects
+ *   Genuine dislike  (groups[g] ≤ fatigue_threshold, or no group):
+ *     Neutral or negative prior history — the pass is likely real aversion.
+ *     → neg[g] += delta_pass (path to permanent blacklist at theta_B)
+ *     → group EMA updated toward −1
+ *     → full facet + geometric effects
  *
  * ── Call chain ───────────────────────────────────────────────────────────────
  *
- *   const q        = queryVector(state)        // send to Chroma
+ *   const q        = queryVector(state)        // send to the vector store
  *   const weighted = reweight(hits, state)     // blacklist + muted filter + Gibbs
  *   const sampled  = sampleHit(weighted)       // draw one candidate
- *   state          = onPlay(state, track)      // or onSkip / onJump
+ *   state          = onLike(state, item)       // or onPass / onJump
  */
 
-import { D, DEFAULTS } from './constants.ts'
+import { DEFAULTS } from './constants.ts'
 import type {
-  ChromaHit,
+  FacetWeights,
+  Facets,
+  Hit,
+  Item,
   KernelParams,
   KernelState,
   KernelStateJSON,
   WeightedHit,
-  TrackFeatures,
-  TasteWeights,
 } from './types.ts'
 import type { Vec } from './Vec.ts'
 import {
@@ -72,67 +87,29 @@ import {
 } from './Vec.ts'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Taste helpers
+// Facet helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const emptyTaste = (): TasteWeights => ({
-  genres: {}, moods: {}, themes: {}, contexts: {},
-})
-
-const decayTaste = (taste: TasteWeights, decay: number): TasteWeights => {
-  const k  = 1 - decay
-  const dk = (rec: Record<string, number>): Record<string, number> =>
-    Object.fromEntries(Object.entries(rec).map(([tag, w]) => [tag, w * k]))
-  return {
-    genres:   dk(taste.genres),
-    moods:    dk(taste.moods),
-    themes:   dk(taste.themes),
-    contexts: dk(taste.contexts),
-  }
+const decayFacets = (facets: FacetWeights, decay: number): FacetWeights => {
+  const k = 1 - decay
+  return Object.fromEntries(Object.entries(facets).map(([ch, rec]) =>
+    [ch, Object.fromEntries(Object.entries(rec).map(([tag, w]) => [tag, w * k]))]))
 }
 
-const accumulateTaste = (
-  taste: TasteWeights,
-  track: Pick<TrackFeatures, 'genres' | 'moods' | 'themes' | 'contexts'>,
-  rate:  number,
-): TasteWeights => {
-  const acc = (rec: Record<string, number>, tags: string[]): Record<string, number> => {
-    const out = { ...rec }
-    for (const tag of tags) out[tag] = (out[tag] ?? 0) + rate
-    return out
+/** Add `delta` to every tag the item carries (clamped at 0 when negative). */
+const bumpFacets = (facets: FacetWeights, item: Facets | undefined, delta: number): FacetWeights => {
+  if (!item) return facets
+  const out: FacetWeights = { ...facets }
+  for (const [ch, tags] of Object.entries(item)) {
+    if (!tags.length) continue
+    const rec = { ...(out[ch] ?? {}) }
+    for (const tag of tags) rec[tag] = Math.max((rec[tag] ?? 0) + delta, 0)
+    out[ch] = rec
   }
-  return {
-    genres:   acc(taste.genres,   track.genres),
-    moods:    acc(taste.moods,    track.moods),
-    themes:   acc(taste.themes,   track.themes),
-    contexts: acc(taste.contexts, track.contexts),
-  }
+  return out
 }
 
-const penalizeTaste = (
-  taste:   TasteWeights,
-  track:   Pick<TrackFeatures, 'genres' | 'moods' | 'themes' | 'contexts'>,
-  penalty: number,
-): TasteWeights => {
-  const pen = (rec: Record<string, number>, tags: string[]): Record<string, number> => {
-    const out = { ...rec }
-    for (const tag of tags) out[tag] = Math.max((out[tag] ?? 0) - penalty, 0)
-    return out
-  }
-  return {
-    genres:   pen(taste.genres,   track.genres),
-    moods:    pen(taste.moods,    track.moods),
-    themes:   pen(taste.themes,   track.themes),
-    contexts: pen(taste.contexts, track.contexts),
-  }
-}
-
-const dimScore = (
-  weights: Record<string, number>,
-  tags:    string[],
-  floor:   number,
-): number => {
-  if (tags.length === 0) return floor
+const channelScore = (weights: Record<string, number>, tags: string[], floor: number): number => {
   const total = Object.values(weights).reduce((s, w) => s + w, 0)
   if (total < 1e-10) return floor
   let score = 0
@@ -140,106 +117,77 @@ const dimScore = (
   return Math.max(score / tags.length, floor)
 }
 
-const taxonomyAffinity = (
-  taste: TasteWeights,
-  track: Pick<TrackFeatures, 'genres' | 'moods' | 'themes' | 'contexts'>,
-  floor: number,
-): number =>
-  (
-    dimScore(taste.genres,   track.genres,   floor) +
-    dimScore(taste.moods,    track.moods,    floor) +
-    dimScore(taste.themes,   track.themes,   floor) +
-    dimScore(taste.contexts, track.contexts, floor)
-  ) / 4
+/** Mean channel score over the channels this item has tags in; null when it
+ *  has none, so an untagged item gets no facet term at all. */
+const facetAffinity = (facets: FacetWeights, item: Facets | undefined, floor: number): number | null => {
+  if (!item) return null
+  const scores = Object.entries(item)
+    .filter(([, tags]) => tags.length)
+    .map(([ch, tags]) => channelScore(facets[ch] ?? {}, tags, floor))
+  return scores.length ? scores.reduce((s, x) => s + x, 0) / scores.length : null
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Affinity transforms
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Artist affinity via logistic transform.
+ * Group affinity via logistic transform.
  *
- *   f_art(a) = 2·σ(c·artists[a])     σ(x) = 1/(1+e^{−x})
+ *   f_group(g) = 2·σ(c·groups[g])     σ(x) = 1/(1+e^{−x})
  *
- *   artists[a] = 0  → f_art = 1,   log f_art = 0      (neutral)
- *   artists[a] → −∞ → f_art → 0,  log f_art → −∞     (suppressed)
- *   artists[a] → +∞ → f_art → 2,  log f_art → log 2  (mildly boosted)
+ *   groups[g] = 0  → f = 1,   log f = 0      (neutral)
+ *   groups[g] → −∞ → f → 0,  log f → −∞     (suppressed)
+ *   groups[g] → +∞ → f → 2,  log f → log 2  (mildly boosted)
  */
-const artistAffinity = (
-  artists:  Record<string, number>,
-  artistId: string,
-  c:        number,
-): number => {
-  const x = artists[artistId] ?? 0
-  return 2 / (1 + Math.exp(-c * x))
+const groupAffinity = (groups: Record<string, number>, group: string, c: number): number =>
+  2 / (1 + Math.exp(-c * (groups[group] ?? 0)))
+
+/** Gaussian in log-ratio: unit-free, and symmetric in "twice" and "half". */
+const scalarAffinity = (logPref: number, x: number, sigma: number): number => {
+  const delta = Math.log(x) - logPref
+  return Math.exp(-(delta * delta) / (2 * sigma * sigma))
 }
 
-const durationAffinity = (
-  pref:       number | null,
-  durationMs: number,
-  sigmaMs:    number,
-): number => {
-  if (pref === null) return 1.0
-  const delta = durationMs - pref
-  return Math.exp(-(delta * delta) / (2 * sigmaMs * sigmaMs))
-}
+const hasScalar = (x: number | undefined): x is number => typeof x === 'number' && x > 0 && Number.isFinite(x)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Skip region geometry
+// Pass region geometry
 // ─────────────────────────────────────────────────────────────────────────────
 
-const computeSkipRegion = (
-  skips: Vec[],
-): { skipCentroid: Vec | null; skipRadius: number } => {
-  if (skips.length === 0) return { skipCentroid: null, skipRadius: 0 }
-  const c = centroid(skips)
+const computePassRegion = (passes: Vec[]): { passCentroid: Vec | null; passRadius: number } => {
+  if (passes.length === 0) return { passCentroid: null, passRadius: 0 }
+  const c = centroid(passes)
   let   r = 0
-  for (const s of skips) {
-    const d = l2dist(s, c)
+  for (const p of passes) {
+    const d = l2dist(p, c)
     if (d > r) r = d
   }
-  return { skipCentroid: c, skipRadius: r }
+  return { passCentroid: c, passRadius: r }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Initialisation
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const initFromSeeds = (
-  tracks: TrackFeatures[],
-  params: KernelParams = {},
-): KernelState => {
-  const { sigma_base = DEFAULTS.sigma_base } = params
-  const d = params.d ?? tracks[0]?.embedding.length ?? DEFAULTS.d
+/** A kernel seeded from items the person already likes, most important FIRST
+ *  (harmonic weights). Each seed counts as a like already taken, so the next
+ *  live like moves μ as the (n+1)-th would rather than overwriting the seeds. */
+export const initFromSeeds = (items: Item[], params: KernelParams = {}): KernelState => {
+  const k0 = emptyKernel({ ...params, d: params.d ?? items[0]?.embedding.length ?? DEFAULTS.d })
+  if (!items.length) return k0
 
-  const harmonicWeights = tracks.map((_, i) => 1 / Math.log(i + 2))
-  const mu = weightedMean(tracks.map(t => t.embedding), harmonicWeights)
+  const harmonicWeights = items.map((_, i) => 1 / Math.log(i + 2))
+  const mu = weightedMean(items.map(it => it.embedding), harmonicWeights)
 
-  const seedRate = 1 / Math.max(tracks.length, 1)
-  let   taste    = emptyTaste()
-  const artists: Record<string, number> = {}
-
-  for (const track of tracks) {
-    taste = accumulateTaste(taste, track, seedRate)
-    artists[track.artistId] = (artists[track.artistId] ?? 0) + seedRate
+  const seedRate = 1 / items.length
+  let   facets: FacetWeights = {}
+  const groups: Record<string, number> = {}
+  for (const it of items) {
+    facets = bumpFacets(facets, it.facets, seedRate)
+    if (it.group !== undefined) groups[it.group] = (groups[it.group] ?? 0) + seedRate
   }
-
-  return {
-    mu,
-    v:            zeros(d),
-    sigma:        sigma_base,
-    skips:        [],
-    skipCentroid: null,
-    skipRadius:   0,
-    t:            0,
-    entropy:      0.2,
-    taste,
-    artists,
-    durationPref: null,
-    neg:          {},
-    blacklist:    new Set(),
-    muted:        new Set(),
-  }
+  return { ...k0, mu, t: items.length, facets, groups }
 }
 
 export const emptyKernel = (params: KernelParams = {}): KernelState => {
@@ -248,14 +196,14 @@ export const emptyKernel = (params: KernelParams = {}): KernelState => {
     mu:           zeros(d),
     v:            zeros(d),
     sigma:        sigma_base,
-    skips:        [],
-    skipCentroid: null,
-    skipRadius:   0,
+    passes:       [],
+    passCentroid: null,
+    passRadius:   0,
     t:            0,
     entropy:      0.2,
-    taste:        emptyTaste(),
-    artists:      {},
-    durationPref: null,
+    facets:       {},
+    groups:       {},
+    scalarPref:   null,
     neg:          {},
     blacklist:    new Set(),
     muted:        new Set(),
@@ -266,11 +214,13 @@ export const emptyKernel = (params: KernelParams = {}): KernelState => {
 // Query
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** μ pushed along v by λ_max·tanh(‖v‖): you search slightly ahead of where you
+ *  are, further the faster you are moving. */
 export const queryVector = (state: KernelState, params: KernelParams = {}): Vec => {
   const { lambda_max = DEFAULTS.lambda_max } = params
   const vn = norm(state.v)
   if (vn < 1e-10) return clone(state.mu)
-  const vhat  = scale(state.v, 1 / vn)
+  const vhat   = scale(state.v, 1 / vn)
   const lambda = lambda_max * Math.tanh(vn)
   return add(state.mu, scale(vhat, lambda))
 }
@@ -282,75 +232,60 @@ export const queryVector = (state: KernelState, params: KernelParams = {}): Vec 
 /**
  * Hard-filter hits against both the permanent blacklist and the session muted set.
  *
- * C̃_t = { e ∈ C_t : π(e) ∉ blacklist_t ∪ muted_t }
+ * C̃_t = { e ∈ C_t : group(e) ∉ blacklist_t ∪ muted_t }
  *
  * Falls back to the original list if filtering empties the set.
  */
-const applySuppressionFilter = (
-  hits:      ChromaHit[],
-  blacklist: Set<string>,
-  muted:     Set<string>,
-): ChromaHit[] => {
-  const suppressed = blacklist.size + muted.size
-  if (suppressed === 0) return hits
-
+const applySuppressionFilter = (hits: Hit[], blacklist: Set<string>, muted: Set<string>): Hit[] => {
+  if (blacklist.size + muted.size === 0) return hits
   const filtered = hits.filter(h => {
-    const id = h.metadata?.artistId
-    return id === undefined || (!blacklist.has(id) && !muted.has(id))
+    const g = h.metadata?.group
+    return g === undefined || (!blacklist.has(g) && !muted.has(g))
   })
-
   return filtered.length > 0 ? filtered : hits
 }
 
-export const reweight = (
-  hits:   ChromaHit[],
-  state:  KernelState,
-  params: KernelParams = {},
-): WeightedHit[] => {
+export const reweight = (hits: Hit[], state: KernelState, params: KernelParams = {}): WeightedHit[] => {
   const {
-    gamma_reg      = DEFAULTS.gamma_reg,
-    temp_base      = DEFAULTS.temp_base,
-    temp_max       = DEFAULTS.temp_max,
-    tau_cat        = DEFAULTS.tau_cat,
-    tau_art        = DEFAULTS.tau_art,
-    tau_dur        = DEFAULTS.tau_dur,
-    cat_floor      = DEFAULTS.cat_floor,
-    art_logistic_c = DEFAULTS.art_logistic_c,
-    dur_sigma_ms   = DEFAULTS.dur_sigma_ms,
+    gamma_reg        = DEFAULTS.gamma_reg,
+    temp_base        = DEFAULTS.temp_base,
+    temp_max         = DEFAULTS.temp_max,
+    tau_facet        = DEFAULTS.tau_facet,
+    tau_group        = DEFAULTS.tau_group,
+    tau_scalar       = DEFAULTS.tau_scalar,
+    facet_floor      = DEFAULTS.facet_floor,
+    group_logistic_c = DEFAULTS.group_logistic_c,
+    scalar_sigma     = DEFAULTS.scalar_sigma,
   } = params
 
   // ── Step 1: hard suppression filter (blacklist ∪ muted) ──────────────────
   const candidates = applySuppressionFilter(hits, state.blacklist, state.muted)
 
   // ── Step 2: temperature ───────────────────────────────────────────────────
-  const { sigma, entropy, skipCentroid, skipRadius } = state
+  const { sigma, entropy, passCentroid, passRadius } = state
   const temp = temp_base + entropy * (temp_max - temp_base)
 
   // ── Step 3: log-weights ───────────────────────────────────────────────────
   const logWeights = candidates.map(hit => {
-    const e = fromArray(
-      hit.embedding instanceof Float32Array
-        ? Array.from(hit.embedding)
-        : hit.embedding as number[]
-    )
+    const e = hit.embedding instanceof Float32Array ? hit.embedding : fromArray(hit.embedding)
 
     let logW = -hit.distance / (2 * sigma * sigma)
 
-    if (skipCentroid !== null && skipRadius > 1e-6) {
-      const dc = l2dist(e, skipCentroid)
-      logW -= gamma_reg * Math.exp(-(dc * dc) / (2 * skipRadius * skipRadius))
+    if (passCentroid !== null && passRadius > 1e-6) {
+      const dc = l2dist(e, passCentroid)
+      logW -= gamma_reg * Math.exp(-(dc * dc) / (2 * passRadius * passRadius))
     }
 
     const meta = hit.metadata
     if (meta) {
-      const catScore = taxonomyAffinity(state.taste, meta, cat_floor)
-      logW += tau_cat * Math.log(Math.max(catScore, 1e-9))
+      const f = facetAffinity(state.facets, meta.facets, facet_floor)
+      if (f !== null) logW += tau_facet * Math.log(Math.max(f, 1e-9))
 
-      const artScore = artistAffinity(state.artists, meta.artistId, art_logistic_c)
-      logW += tau_art * Math.log(Math.max(artScore, 1e-9))
+      if (meta.group !== undefined)
+        logW += tau_group * Math.log(Math.max(groupAffinity(state.groups, meta.group, group_logistic_c), 1e-9))
 
-      const durScore = durationAffinity(state.durationPref, meta.durationMs, dur_sigma_ms)
-      logW += tau_dur * Math.log(Math.max(durScore, 1e-9))
+      if (state.scalarPref !== null && hasScalar(meta.scalar))
+        logW += tau_scalar * Math.log(Math.max(scalarAffinity(state.scalarPref, meta.scalar, scalar_sigma), 1e-9))
     }
 
     return logW
@@ -383,170 +318,156 @@ export const sampleHit = (weighted: WeightedHit[]): WeightedHit => {
 // State transitions
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const onPlay = (
+/** κ_like: the person took this item. */
+export const onLike = (
   state:   KernelState,
-  track:   TrackFeatures,
+  item:    Item,
   muPrior: Vec | null = null,
   params:  KernelParams = {},
 ): KernelState => {
   const {
-    alpha        = DEFAULTS.alpha,
-    beta         = DEFAULTS.beta,
-    sigma_base   = DEFAULTS.sigma_base,
-    rho          = DEFAULTS.rho,
-    prior_k      = DEFAULTS.prior_k,
-    alpha_taste  = DEFAULTS.alpha_taste,
-    taste_decay  = DEFAULTS.taste_decay,
-    beta_artist  = DEFAULTS.beta_artist,
-    rho_duration = DEFAULTS.rho_duration,
+    alpha       = DEFAULTS.alpha,
+    beta        = DEFAULTS.beta,
+    sigma_base  = DEFAULTS.sigma_base,
+    rho         = DEFAULTS.rho,
+    prior_k     = DEFAULTS.prior_k,
+    alpha_facet = DEFAULTS.alpha_facet,
+    facet_decay = DEFAULTS.facet_decay,
+    beta_group  = DEFAULTS.beta_group,
+    rho_scalar  = DEFAULTS.rho_scalar,
   } = params
 
-  const e   = track.embedding
+  const e   = item.embedding
   const mu0 = state.mu
   const t1  = state.t + 1
 
-  let mu1 = add(scale(e, alpha), scale(mu0, 1 - alpha))
+  // Bias-corrected step: 1 on the first like, settling to α.
+  const w = alpha / (1 - Math.pow(1 - alpha, t1))
+  let mu1 = add(mu0, scale(sub(e, mu0), w))
   if (muPrior !== null) {
     const pull = prior_k / t1
     mu1 = add(mu1, scale(sub(muPrior, mu1), Math.min(pull, 1)))
   }
-  const v1     = add(scale(state.v, beta), scale(sub(e, mu0), 1 - beta))
+  // One position has no direction: velocity starts at the second like.
+  const v1     = state.t === 0 ? state.v : add(scale(state.v, beta), scale(sub(e, mu0), 1 - beta))
   const sigma1 = rho * state.sigma + (1 - rho) * sigma_base
 
-  const taste1   = accumulateTaste(decayTaste(state.taste, taste_decay), track, alpha_taste)
-  const artistId = track.artistId
-  const artists1 = {
-    ...state.artists,
-    [artistId]: beta_artist * (state.artists[artistId] ?? 0) + (1 - beta_artist),
+  const facets1 = bumpFacets(decayFacets(state.facets, facet_decay), item.facets, alpha_facet)
+  const groups1 = item.group === undefined ? state.groups : {
+    ...state.groups,
+    [item.group]: beta_group * (state.groups[item.group] ?? 0) + (1 - beta_group),
   }
-  const durationPref1 =
-    state.durationPref === null
-      ? track.durationMs
-      : rho_duration * state.durationPref + (1 - rho_duration) * track.durationMs
-
-  const entropy1 = Math.max(state.entropy * 0.95, 0.05)
+  const scalarPref1 = !hasScalar(item.scalar)
+    ? state.scalarPref
+    : state.scalarPref === null
+      ? Math.log(item.scalar)
+      : rho_scalar * state.scalarPref + (1 - rho_scalar) * Math.log(item.scalar)
 
   return {
     ...state,
-    mu:           mu1,
-    v:            v1,
-    sigma:        sigma1,
-    t:            t1,
-    entropy:      entropy1,
-    taste:        taste1,
-    artists:      artists1,
-    durationPref: durationPref1,
-    // skips, skipCentroid, skipRadius, neg, blacklist, muted unchanged on play
+    mu:         mu1,
+    v:          v1,
+    sigma:      sigma1,
+    t:          t1,
+    entropy:    Math.max(state.entropy * 0.95, 0.05),
+    facets:     facets1,
+    groups:     groups1,
+    scalarPref: scalarPref1,
+    // passes, passCentroid, passRadius, neg, blacklist, muted unchanged on a like
   }
 }
 
 /**
- * κ_skip: update state on a skipped track.
+ * κ_pass: the person was shown this item and passed on it.
  *
- * Before any geometric update, classifies the skip as fatigue or dislike:
+ * Before any geometric update, classifies the pass as fatigue or dislike:
  *
- *   Fatigue  (artists[a] > fatigue_threshold):
- *     - muted ← muted ∪ {a}          session-scoped, not persisted
+ *   Fatigue  (groups[g] > fatigue_threshold):
+ *     - muted ← muted ∪ {g}          session-scoped, not persisted
  *     - neg unchanged                 no path to permanent blacklist
- *     - artist EMA unchanged          preference signal preserved
- *     - taste penalized lightly       the track's tags still got a skip signal
- *     - geometric effects fire        track region is still repelled this session
+ *     - group EMA unchanged           preference signal preserved
+ *     - facets penalized              the item's tags still got a pass
+ *     - geometric effects fire        item region is still repelled this session
  *
- *   Genuine dislike  (artists[a] ≤ fatigue_threshold):
- *     - neg[a] += delta_skip          path to permanent blacklist
+ *   Genuine dislike  (groups[g] ≤ fatigue_threshold):
+ *     - neg[g] += delta_pass          path to permanent blacklist
  *     - blacklist updated if needed
- *     - artist EMA updated toward −1
- *     - taste penalized               full categorical signal
+ *     - group EMA updated toward −1
+ *     - facets penalized
  *     - geometric effects fire
  *
- * Geometric effects (velocity deflection, position repulsion, skip buffer,
- * spread expansion, entropy increase) fire in both cases.
+ * An item with no group skips the classification: facets and geometry only.
+ * Geometric effects (velocity deflection, position repulsion, pass buffer,
+ * spread expansion, entropy increase) fire in every case.
  */
-export const onSkip = (
-  state:  KernelState,
-  track:  TrackFeatures,
-  params: KernelParams = {},
-): KernelState => {
+export const onPass = (state: KernelState, item: Item, params: KernelParams = {}): KernelState => {
   const {
     sigma_max         = DEFAULTS.sigma_max,
     gamma_base        = DEFAULTS.gamma_base,
-    skip_window       = DEFAULTS.skip_window,
-    skip_taste_pen    = DEFAULTS.skip_taste_pen,
-    beta_artist       = DEFAULTS.beta_artist,
-    delta_skip        = DEFAULTS.delta_skip,
+    pass_window       = DEFAULTS.pass_window,
+    pass_facet_pen    = DEFAULTS.pass_facet_pen,
+    beta_group        = DEFAULTS.beta_group,
+    delta_pass        = DEFAULTS.delta_pass,
     theta_B           = DEFAULTS.theta_B,
     epsilon           = DEFAULTS.epsilon,
     fatigue_threshold = DEFAULTS.fatigue_threshold,
   } = params
 
-  const e        = track.embedding
-  const mu       = state.mu
-  const entropy  = state.entropy
-  const artistId = track.artistId
+  const e       = item.embedding
+  const mu      = state.mu
+  const entropy = state.entropy
+  const g       = item.group
 
-  // ── Skip classification ───────────────────────────────────────────────────
-  const priorEma  = state.artists[artistId] ?? 0
-  const isFatigue = priorEma > fatigue_threshold
-
-  // ── Fiber suppression (only on genuine dislike) ───────────────────────────
   let neg1       = state.neg
   let blacklist1 = state.blacklist
-  let artists1   = state.artists
+  let groups1    = state.groups
   let muted1     = state.muted
-  let taste1     = state.taste
 
-  if (isFatigue) {
-    // Session mute — transient, no blacklist progression
-    muted1 = new Set(state.muted)
-    muted1.add(artistId)
-    // Still penalize taste lightly (the specific track's tags got a skip)
-    taste1 = penalizeTaste(state.taste, track, skip_taste_pen)
-    // artists EMA and neg are intentionally unchanged
-  } else {
-    // Genuine dislike — full signal
-    neg1 = { ...state.neg, [artistId]: (state.neg[artistId] ?? 0) + delta_skip }
-    blacklist1 = new Set(state.blacklist)
-    if (neg1[artistId] > theta_B) blacklist1.add(artistId)
-
-    artists1 = {
-      ...state.artists,
-      [artistId]: beta_artist * priorEma + (1 - beta_artist) * (-1),
+  if (g !== undefined) {
+    const prior = state.groups[g] ?? 0
+    if (prior > fatigue_threshold) {
+      // Session mute — transient, no blacklist progression
+      muted1 = new Set(state.muted)
+      muted1.add(g)
+    } else {
+      // Genuine dislike — full signal
+      neg1 = { ...state.neg, [g]: (state.neg[g] ?? 0) + delta_pass }
+      blacklist1 = new Set(state.blacklist)
+      if (neg1[g] > theta_B) blacklist1.add(g)
+      groups1 = { ...state.groups, [g]: beta_group * prior + (1 - beta_group) * (-1) }
     }
-    taste1 = penalizeTaste(state.taste, track, skip_taste_pen)
   }
+  const facets1 = bumpFacets(state.facets, item.facets, -pass_facet_pen)
 
-  // ── Geometric effects (fire in both cases) ────────────────────────────────
+  // ── Geometric effects (fire in every case) ────────────────────────────────
   const v1 = deflect(state.v, sub(e, mu))
 
   const away     = sub(mu, e)
   const awayNorm = norm(away)
   const gamma    = gamma_base * (1 + entropy)
-  const mu1      = awayNorm >= epsilon
+  const mu1      = state.t > 0 && awayNorm >= epsilon
     ? add(mu, scale(away, gamma / awayNorm))
     : mu
 
-  const skips1 = [...state.skips, clone(e)]
-  if (skips1.length > skip_window) skips1.shift()
-  const { skipCentroid: skipCentroid1, skipRadius: skipRadius1 } = computeSkipRegion(skips1)
-
-  const sigma1   = Math.min(state.sigma * 1.1, sigma_max)
-  const entropy1 = Math.min(entropy * 1.1 + 0.02, 1.0)
+  const passes1 = [...state.passes, clone(e)]
+  if (passes1.length > pass_window) passes1.shift()
+  const { passCentroid, passRadius } = computePassRegion(passes1)
 
   return {
     ...state,
     mu:           mu1,
     v:            v1,
-    sigma:        sigma1,
-    skips:        skips1,
-    skipCentroid: skipCentroid1,
-    skipRadius:   skipRadius1,
-    entropy:      entropy1,
-    taste:        taste1,
-    artists:      artists1,
+    sigma:        Math.min(state.sigma * 1.1, sigma_max),
+    passes:       passes1,
+    passCentroid,
+    passRadius,
+    entropy:      Math.min(entropy * 1.1 + 0.02, 1.0),
+    facets:       facets1,
+    groups:       groups1,
     neg:          neg1,
     blacklist:    blacklist1,
     muted:        muted1,
-    // t, durationPref unchanged on skip
+    // t, scalarPref unchanged on a pass
   }
 }
 
@@ -566,36 +487,44 @@ export const serializeState = (state: KernelState): KernelStateJSON => ({
   mu:           toArray(state.mu),
   v:            toArray(state.v),
   sigma:        state.sigma,
-  skips:        state.skips.map(toArray),
-  skipCentroid: state.skipCentroid ? toArray(state.skipCentroid) : null,
-  skipRadius:   state.skipRadius,
+  passes:       state.passes.map(toArray),
+  passCentroid: state.passCentroid ? toArray(state.passCentroid) : null,
+  passRadius:   state.passRadius,
   t:            state.t,
   entropy:      state.entropy,
-  taste:        state.taste,
-  artists:      state.artists,
-  durationPref: state.durationPref,
+  facets:       state.facets,
+  groups:       state.groups,
+  scalarPref:   state.scalarPref,
   neg:          state.neg,
   blacklist:    [...state.blacklist].sort(),
   // muted deliberately absent — always starts empty on next session
 })
 
-/** Rehydrated state always has muted = new Set() — session fatigue clears between sessions. */
-export const deserializeState = (json: KernelStateJSON): KernelState => ({
-  mu:           new Float32Array(json.mu),
-  v:            new Float32Array(json.v),
-  sigma:        json.sigma,
-  skips:        json.skips.map(a => new Float32Array(a)),
-  skipCentroid: json.skipCentroid ? new Float32Array(json.skipCentroid) : null,
-  skipRadius:   json.skipRadius,
-  t:            json.t,
-  entropy:      json.entropy,
-  taste:        json.taste,
-  artists:      json.artists,
-  durationPref: json.durationPref,
-  neg:          json.neg,
-  blacklist:    new Set(json.blacklist),
-  muted:        new Set(),  // session fatigue always starts fresh
-})
+/** Rehydrated state always has muted = new Set() — session fatigue clears
+ *  between sessions. Also reads state saved by 0.0.x (skips/artists/taste/
+ *  durationPref); a saved duration preference is dropped, since it was in ms
+ *  and the scalar preference is a log. */
+export const deserializeState = (json: KernelStateJSON): KernelState => {
+  const old = json as Partial<KernelStateJSON> & Record<string, any>
+  const passes = old.passes ?? old.skips ?? []
+  const centroidArr = old.passCentroid ?? old.skipCentroid ?? null
+  return {
+    mu:           new Float32Array(json.mu),
+    v:            new Float32Array(json.v),
+    sigma:        json.sigma,
+    passes:       passes.map((a: number[]) => new Float32Array(a)),
+    passCentroid: centroidArr ? new Float32Array(centroidArr) : null,
+    passRadius:   old.passRadius ?? old.skipRadius ?? 0,
+    t:            json.t,
+    entropy:      json.entropy,
+    facets:       old.facets ?? old.taste ?? {},
+    groups:       old.groups ?? old.artists ?? {},
+    scalarPref:   old.scalarPref ?? null,
+    neg:          json.neg ?? {},
+    blacklist:    new Set(json.blacklist ?? []),
+    muted:        new Set(),  // session fatigue always starts fresh
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Diagnostics
@@ -605,56 +534,48 @@ export interface KernelSnapshot {
   speed:         number
   lookahead:     number
   spread:        number
-  nSkips:        number
-  skipRadius:    number
+  nPasses:       number
+  passRadius:    number
   timestep:      number
   entropy:       number
-  topGenres:     [string, number][]
-  topMoods:      [string, number][]
-  topThemes:     [string, number][]
-  topArtists:    [string, number][]
-  durationPref:  string | null
+  topFacets:     Record<string, [string, number][]>
+  topGroups:     [string, number][]
+  scalarPref:    number | null
   blacklisted:   string[]
-  muted:         string[]           // session-muted artists
+  muted:         string[]           // session-muted groups
   nearThreshold: [string, number][] // approaching theta_B
 }
 
-export const describe = (
-  state:  KernelState,
-  params: KernelParams = {},
-): KernelSnapshot => {
+export const describe = (state: KernelState, params: KernelParams = {}): KernelSnapshot => {
   const { lambda_max = DEFAULTS.lambda_max, theta_B = DEFAULTS.theta_B } = params
 
   const vn     = norm(state.v)
   const lambda = lambda_max * Math.tanh(vn)
+  const r3     = (x: number) => Math.round(x * 1000) / 1000
 
   const topN = (rec: Record<string, number>, n = 3): [string, number][] =>
     Object.entries(rec)
       .sort(([, a], [, b]) => b - a)
       .slice(0, n)
-      .map(([k, v]) => [k, Math.round(v * 1000) / 1000])
+      .map(([k, v]) => [k, r3(v)])
 
   const nearThreshold: [string, number][] = Object.entries(state.neg)
-    .filter(([a, v]) => v >= theta_B * 0.5 && !state.blacklist.has(a))
+    .filter(([g, v]) => v >= theta_B * 0.5 && !state.blacklist.has(g))
     .sort(([, a], [, b]) => b - a)
     .slice(0, 5)
     .map(([k, v]) => [k, Math.round(v * 100) / 100])
 
   return {
-    speed:         Math.round(vn * 1000) / 1000,
-    lookahead:     Math.round(lambda * 1000) / 1000,
-    spread:        Math.round(state.sigma * 1000) / 1000,
-    nSkips:        state.skips.length,
-    skipRadius:    Math.round(state.skipRadius * 1000) / 1000,
+    speed:         r3(vn),
+    lookahead:     r3(lambda),
+    spread:        r3(state.sigma),
+    nPasses:       state.passes.length,
+    passRadius:    r3(state.passRadius),
     timestep:      state.t,
-    entropy:       Math.round(state.entropy * 1000) / 1000,
-    topGenres:     topN(state.taste.genres),
-    topMoods:      topN(state.taste.moods),
-    topThemes:     topN(state.taste.themes),
-    topArtists:    topN(state.artists),
-    durationPref:  state.durationPref !== null
-      ? `${Math.round(state.durationPref / 1000)}s`
-      : null,
+    entropy:       r3(state.entropy),
+    topFacets:     Object.fromEntries(Object.entries(state.facets).map(([ch, rec]) => [ch, topN(rec)])),
+    topGroups:     topN(state.groups),
+    scalarPref:    state.scalarPref === null ? null : r3(Math.exp(state.scalarPref)),
     blacklisted:   [...state.blacklist].sort(),
     muted:         [...state.muted].sort(),
     nearThreshold,

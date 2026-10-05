@@ -1,7 +1,7 @@
 /**
  * vec.ts — minimal Float32Array vector math
  * All operations are pure (no mutation) unless suffixed with `_`.
- * d = 384 (all-MiniLM-L6-v2, L2 space)
+ * Dimension-agnostic: every function works at whatever length it is given.
  */
 export type Vec = Float32Array
 
@@ -90,7 +90,7 @@ export const projectOut = (b: Vec, a: Vec): Vec => {
  * exists (b · â > 0).  If b already points away from a (b · â ≤ 0),
  * b is returned unchanged — removing it would dampen escape-directed velocity.
  *
- * Used in onSkip in place of projectOut.
+ * Used in onPass in place of projectOut.
  */
 export const deflect = (b: Vec, a: Vec): Vec => {
   const an = norm(a)
@@ -98,12 +98,12 @@ export const deflect = (b: Vec, a: Vec): Vec => {
   const ahat = scale(a, 1 / an)
   const proj = dot(b, ahat)
   if (proj <= 0) return clone(b)          // already pointing away — preserve
-  return sub(b, scale(ahat, proj))        // remove toward-skip component only
+  return sub(b, scale(ahat, proj))        // remove toward-pass component only
 }
 
 /**
  * Convert a plain number[] to a Float32Array Vec.
- * Used when rehydrating embeddings from JSON or Chroma responses.
+ * Used when rehydrating embeddings from JSON or a vector store's response.
  */
 export const fromArray = (a: number[]): Vec => new Float32Array(a)
 
