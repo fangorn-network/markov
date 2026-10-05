@@ -32,7 +32,7 @@ with a walker in it.
 ## Use
 
 ```ts
-import { emptyKernel, onPlay, onSkip, queryVector, reweight } from '@fangorn/kernel'
+import { emptyKernel, onPlay, onSkip, queryVector, reweight } from '@fangorn-network/markov'
 
 let k = emptyKernel()
 k = onPlay(k, features)              // TrackFeatures: embedding + tags + artist
@@ -47,6 +47,7 @@ on your disk. Nobody else has a copy.
 
 ```sh
 npm test          # node test/kernel.test.ts — no deps, Node 22.18+
+npm run build     # dist/ — the JS that ships (Node will not strip types under node_modules)
 ```
 
 Five assertions, run in two spaces: playing leans the query, ranking follows the

@@ -1,9 +1,22 @@
 {
   "name": "@fangorn-network/markov",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A taste kernel: a local, portable point-of-view in an embedding space.",
   "license": "MIT",
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "test": "node test/kernel.test.ts" }
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "HEADER.txt"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
+    "test": "node test/kernel.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
 }

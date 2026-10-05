@@ -1,0 +1,15 @@
+{
+  // Emits the JS that ships: Node will not strip types under node_modules, so
+  // `exports` points at dist/ and src/ stays the source of truth.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rewriteRelativeImportExtensions": true,
+    "noEmit": false,
+    "declaration": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
